@@ -811,6 +811,7 @@ from hermes_cli.main_desktop import (  # frozen updater surface: update_cmd*.py 
     _desktop_dist_exists,
     _desktop_macos_relaunchable_fixup,
     _desktop_packaged_executable,
+    _install_rebuilt_desktop_app,
 )
 from hermes_cli.main_web_build import (
     _sweep_stale_bytecode_if_checkout_changed,
@@ -1253,6 +1254,10 @@ def _resolve_last_session(source: str = "cli") -> Optional[str]:
     global MRU. Falls back to the unscoped MRU when no session matches the
     current workspace, preserving the old behaviour for fresh directories.
     """
+    # A finite `hermes -z`/`chat -q` run is CLI history too: `hermes -z … --resume latest` chains on it.
+    if source == "cli":
+        from run_agent import CLI_FAMILY_SOURCES
+        source = sorted(CLI_FAMILY_SOURCES)
     with _session_db() as db:
         ws_key = _resolve_workspace_key()
         if ws_key:
@@ -2136,7 +2141,7 @@ _FROZEN_UPDATER_SURFACE: dict[str, tuple[str, ...]] = {
         "_ledger_reapable_backend_pids", "_leftover_pausable_gateway_pids", "_npm_lockfile_changed",
         "_orphaned_desktop_backend_pids", "_park_stashed_changes",
         "_pause_windows_gateways_for_update", "_print_parked_branch_kept_notice",
-        "_print_parked_branch_skip_warning",
+        "_print_parked_branch_skip_warning", "_reapply_plugin_python_dependencies",
         "_refresh_active_lazy_features", "_refresh_active_memory_provider_dependencies",
         "_refresh_bootstrap_cache_scripts", "_refresh_windows_gateway_launchers",
         "_relaunch_stopped_serves",

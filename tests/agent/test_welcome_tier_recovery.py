@@ -78,7 +78,7 @@ def _agent(**overrides):
     lines = []
     agent = SimpleNamespace(
         provider="nous", api_key=make_jwt(), model="gpt-5", base_url=WELCOME, log_prefix="", _rate_limit_state=None,
-        _vprint=lambda text, force=False: lines.append(text),
+        _vprint=lambda text, force=False, diagnostic=False: lines.append(text),
         _try_refresh_nous_client_credentials=lambda **kw: True,
     )
     for k, v in overrides.items():
@@ -114,6 +114,19 @@ class TestOneShotRecoveries:
         body = {"status": 400, "message": "Anonymous accounts must use https://welcome-api.nousresearch.com for inference."}
         classified = _classify(_gateway_error(400, body), base_url=PAID)
         assert classified.error_context["welcome_route"] == "anon_on_paid_host"
+        retry = TurnRetryState()
+        assert _recover_welcome_tier(agent, classified, retry) is True
+        assert calls == [{"force": True}]
+        assert _recover_welcome_tier(agent, classified, retry) is False
+
+    def test_a_named_account_on_the_welcome_host_re_reads_the_route_once(self):
+        from agent.turn_recovery import _recover_welcome_tier
+        calls = []
+        agent = _agent(api_key=make_jwt(account_tier="free", client_id="hermes-cli"),
+                       _try_refresh_nous_client_credentials=lambda **kw: calls.append(kw) or True)
+        body = {"status": 400, "message": "This endpoint serves anonymous Hermes Agent accounts only. Use https://inference-api.nousresearch.com with your API key or signed-in account."}
+        classified = classify_api_error(_gateway_error(400, body), provider="nous", base_url=WELCOME, api_key=agent.api_key)
+        assert classified.error_context["welcome_route"] == "named_on_welcome_host"
         retry = TurnRetryState()
         assert _recover_welcome_tier(agent, classified, retry) is True
         assert calls == [{"force": True}]
@@ -193,6 +206,8 @@ class TestTerminalResultsCarryTheFreeTierBlock:
                        _summarize_api_error=lambda e: "HTTP 403: no permissions", _emit_status=lambda *a: None,
                        _persist_session=lambda *a: None, _plines=lambda *a: None, _buffer_status=lambda *a: None,
                        _rate_limit_state=None, _has_pending_fallback=lambda: False)
+        from agent.status_output import StatusOutputMixin
+        agent._emit_diagnostic_status = StatusOutputMixin._emit_diagnostic_status.__get__(agent)
         return agent
 
     def test_a_dark_tier_403_is_stamped_disabled_with_the_chat_sentence(self):

@@ -41,13 +41,16 @@ logger = logging.getLogger("agent.conversation_loop")
 def _vlines(agent: Any, *lines: str) -> None:
     """Force-``_vprint`` each line prefixed with ``agent.log_prefix``."""
     for line in lines:
-        agent._vprint(f"{agent.log_prefix}{line}", force=True)
+        agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
 
 
 def _plines(agent: Any, *lines: str) -> None:
     """``print`` each line prefixed with ``agent.log_prefix``."""
-    for line in lines:
-        print(f"{agent.log_prefix}{line}")
+    from gateway.warning_notifications import render_notification
+    render_notification(
+        lambda: [print(f"{agent.log_prefix}{line}") for line in lines],
+        platform=getattr(agent, "_notification_platform", getattr(agent, "platform", "cli")),
+        user_config=getattr(agent, "_notification_config", None))
 
 
 def _blines(agent: Any, *lines: str) -> None:
@@ -318,7 +321,8 @@ def _print_anthropic_401_diagnostics(agent: Any, key: Any) -> None:
         f"     • Check ANTHROPIC_TOKEN in {_dhh}/.env for Hermes-managed OAuth/setup tokens",
         f"     • Check ANTHROPIC_API_KEY in {_dhh}/.env for API keys or legacy token values",
         "     • For API keys: verify at https://platform.claude.com/settings/keys",
-        "     • For Claude Code: run 'claude /login' to refresh, then retry",
+        "     • Hermes login (OAuth): run 'hermes auth add anthropic' to sign in again, then retry",
+        "     • Inspect what Hermes holds: hermes auth list anthropic",
         "     • Legacy cleanup: hermes config set ANTHROPIC_TOKEN \"\"",
         "     • Clear stale keys: hermes config set ANTHROPIC_API_KEY \"\"",
     )
@@ -480,13 +484,21 @@ def _recover_format_errors(
     return False
 
 
+_WELCOME_ROUTE_HEAL_COPY = {
+    "anon_on_paid_host": "Reconnected to the free model's own route.",
+    "named_on_welcome_host": "Reconnected to your Nous account's own route.",
+}
+
+
 def _recover_welcome_tier(agent: Any, classified: Any, _retry: TurnRetryState) -> bool:
     """Two one-shot repairs for the Nous free tier, both silent on the wire and named once in chat.
 
     ``model_not_free``: the session asked the welcome host for a model it does not serve; move
     to the first alternate the gateway named (its own model) and retry, instead of failing the
-    turn. ``anon_on_paid_host``: this process is pointed at the paid host with a free-tier
-    identity (a stale route); re-read the credentials, which heals the URL, and retry.
+    turn. ``anon_on_paid_host`` / ``named_on_welcome_host``: this process is pointed at the other
+    identity's host (a stale route); re-read the credentials, which heals the URL, and retry. The
+    refresh reports False when the store yields the same route, so a user-set
+    ``NOUS_INFERENCE_BASE_URL`` falls straight through to the terminal copy.
 
     Reads the CLASSIFIER's context (``classified.error_context``): that is where
     ``_nous_welcome_tier`` parks ``welcome_refusal`` / ``welcome_route``. The turn's other context
@@ -508,14 +520,14 @@ def _recover_welcome_tier(agent: Any, classified: Any, _retry: TurnRetryState) -
             logger.info("%sNous free tier: moved %s -> %s after model_not_free", agent.log_prefix, requested, target)
             return True
     route = ctx.get("welcome_route") if isinstance(ctx, dict) else None
-    if route == "anon_on_paid_host" and not _retry.welcome_route_heal_attempted:
+    if route in _WELCOME_ROUTE_HEAL_COPY and not _retry.welcome_route_heal_attempted:
         _retry.welcome_route_heal_attempted = True
         try:
             healed = bool(agent._try_refresh_nous_client_credentials(force=True))
         except Exception:
             healed = False
         if healed:
-            _vlines(agent, "🔐 Reconnected to the free model's own route. Retrying request...")
+            _vlines(agent, f"🔐 {_WELCOME_ROUTE_HEAL_COPY[route]} Retrying request...")
             return True
     return False
 
@@ -809,7 +821,7 @@ def nonretryable_client_error_result(
     _nonretryable_summary = agent._summarize_api_error(api_error)
     _plabel = provider_label_for(provider)
     _label = _NONRETRYABLE_LABELS.get(classified.reason, f"{_plabel} rejected the request and retrying won't help")
-    agent._emit_status(f"❌ {_label}: {_nonretryable_summary}")
+    agent._emit_diagnostic_status(f"❌ {_label}: {_nonretryable_summary}")
     # The endpoint/status trace is developer detail: verbose only (the log has it always).
     if getattr(agent, "verbose_logging", False):
         _vlines(
@@ -931,12 +943,12 @@ def max_retries_exhausted_result(
     if _is_billing:
         if classified.billing_unverified:
             # Ambiguous body — hedge the terminal line.
-            agent._emit_status(
+            agent._emit_diagnostic_status(
                 "❌ Provider reported usage/credit exhaustion "
                 f"(unverified — may be a content-filter rejection) — {_final_summary}"
             )
         else:
-            agent._emit_status(f"❌ Billing or credits exhausted — {_final_summary}")
+            agent._emit_diagnostic_status(f"❌ Billing or credits exhausted — {_final_summary}")
         _billing_kw = dict(
             capability="model access", provider=provider, base_url=str(base_url), model=model,
             unverified=classified.billing_unverified,
@@ -944,9 +956,9 @@ def max_retries_exhausted_result(
         _billing_guidance = _billing_or_entitlement_message(**_billing_kw)
         _print_billing_or_entitlement_guidance(agent, **_billing_kw)
     elif is_rate_limited:
-        agent._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
+        agent._emit_diagnostic_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
     else:
-        agent._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
+        agent._emit_diagnostic_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
     _vlines(agent, f"   💀 Final error: {_final_summary}")
     _welcome_hint = _welcome_tier_guidance(classified, model=model, in_chat=False)
     if _welcome_hint:
@@ -1192,9 +1204,9 @@ def compute_error_backoff(
         _wait_reason = "Provider overloaded" if is_zai_coding_overload and not is_rate_limited else "Rate limited"
         _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
         if _backoff_policy == "zai_coding_overload_long":
-            agent._emit_status(_rate_limit_status)
+            agent._emit_diagnostic_status(_rate_limit_status)
         else:
-            agent._buffer_status(_rate_limit_status)
+            agent._buffer_diagnostic_status(_rate_limit_status)
     else:
         _retry_status = (
             f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})..."
@@ -1203,15 +1215,15 @@ def compute_error_backoff(
             # A 5xx Retry-After can now reach the 600s cap; buffering that wait
             # would leave the user silent for minutes, so surface long provider
             # cooldowns immediately (mirrors the zai_coding_overload_long path).
-            agent._emit_status(_retry_status)
+            agent._emit_diagnostic_status(_retry_status)
         else:
-            agent._buffer_status(_retry_status)
+            agent._buffer_diagnostic_status(_retry_status)
     # The buffered line only replays if every retry fails; the live status
     # line is the one thing the user sees meanwhile. Name the wait there so a
     # 60s backoff after a 5xx is not an anonymous spinner — this is transient
     # (rewritten by the next frame, cleared on recovery), so it does not add
     # the transcript chatter the buffer exists to avoid.
-    agent._emit_wait_notice(
+    agent._emit_diagnostic_wait(
         f"⏳ waiting on provider — retrying in {wait_time:.0f}s (attempt {retry_count}/{max_retries})"
     )
     logger.warning(
@@ -1538,7 +1550,7 @@ def route_classified_error(
             )
             conversation_history = conversation_history_after_compression(agent, messages, conversation_history)
             if len(messages) < original_len or old_ctx > _LONG_CONTEXT_TIER_CAP:
-                agent._buffer_status(
+                agent._buffer_diagnostic_status(
                     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE.format(
                         new_ctx=_LONG_CONTEXT_TIER_CAP, old_ctx=old_ctx
                     )
@@ -1585,7 +1597,7 @@ def route_classified_error(
             False if _is_upstream else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
         if not pool_may_recover:
-            agent._buffer_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
+            agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             if agent._try_activate_fallback(reason=classified.reason):
                 return _fallback_break()
 
@@ -1597,7 +1609,7 @@ def route_classified_error(
         and agent._fallback_index < len(agent._fallback_chain)
     ):
         _retry.auth_failover_attempted = True
-        agent._buffer_status(
+        agent._buffer_diagnostic_status(
             "🔐 Authentication failed and could not be refreshed — "
             "switching to fallback provider..."
         )
