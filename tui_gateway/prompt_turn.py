@@ -614,6 +614,7 @@ def _invoke_agent(
         run_kwargs["task_id"] = session["session_key"]
     if display_kind and "persist_user_display_kind" in run_params:
         run_kwargs["persist_user_display_kind"] = display_kind
+    if display_metadata and "persist_user_display_metadata" in run_params:
         run_kwargs["persist_user_display_metadata"] = display_metadata
     if turn_author and "turn_author" in run_params:
         run_kwargs["turn_author"] = turn_author
@@ -798,7 +799,9 @@ def _finish_turn(sid: str, session: dict, st: _TurnRun) -> None:
         run_kwargs.clear()
     try:  # while the profile HERMES_HOME override is still active (session's own config)
         from hermes_cli.mem_trim import trim_memory
-        trim_memory(reason="tui turn completion")
+        # The finishing session is still marked running here; every OTHER session must be idle (#58576).
+        if _sessions_quiescent(exclude=sid):
+            trim_memory(reason="tui turn completion")
     except Exception:
         logger.debug("post-turn memory trim failed", exc_info=True)
     if st.thinking_started:
