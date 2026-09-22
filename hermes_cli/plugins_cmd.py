@@ -21,7 +21,7 @@ from hermes_cli.cli_output import line_input
 from hermes_cli.config import cfg_get
 from hermes_cli.plugin_capabilities import _child_dict
 from hermes_cli.secret_prompt import masked_secret_prompt
-from utils import atomic_write_text
+from utils import atomic_write_text, rmtree_readonly
 
 logger = logging.getLogger(__name__)
 
@@ -709,7 +709,7 @@ def _swap_in_plugin(tmp_target: Path, target: Path, backup: Path, old_metadata: 
         _write_install_metadata(new_metadata)
     except Exception:
         if target.exists():
-            shutil.rmtree(target)
+            rmtree_readonly(target)
         if replaced_existing and backup.exists():
             os.replace(backup, target)
         if old_metadata:
@@ -727,12 +727,17 @@ def _install_plugin_core(
     scan_decision_cb=None,
     reviewed_pin: Optional[str] = None,
     python_deps: bool = True,
+    catalog: Optional[dict] = None,
+    allow_removed: bool = False,
 ) -> tuple[Path, dict, str]:
     """Clone a Git plugin and atomically record its source and exact revision.
 
     *reviewed_pin* is the curated-catalog sha for this install; the scan trusts the tree
     only when the checked-out revision is exactly that sha. *python_deps* False skips the
-    dependency conflict gate (``--no-deps``: the user installs them by hand)."""
+    dependency conflict gate (``--no-deps``: the user installs them by hand). *catalog*
+    (``{"name", "repo", "tier", "pin"}``) is recorded on the install-metadata record with the
+    checked-out sha — provenance lives OUTSIDE the plugin tree, so a repo cannot forge it.
+    *allow_removed* records that the user knowingly bypassed the kill list."""
     requested_revision = _normalize_exact_revision(ref) if ref is not None else None
     try:
         git_url, subdir = _resolve_git_url(identifier)
@@ -779,10 +784,13 @@ def _install_plugin_core(
                 f"Plugin '{plugin_name}' is pinned. Reinstall it with an explicit "
                 "--ref <40-character commit SHA> to change its source or revision.")
 
-        new_metadata = {
-            **old_metadata,
-            plugin_name: {"pinned": requested_revision is not None, "revision": installed_revision, "source": source},
-        }
+        record: dict[str, object] = {
+            "pinned": requested_revision is not None, "revision": installed_revision, "source": source}
+        if catalog:
+            record["catalog"] = {**catalog, "sha": installed_revision}
+        if allow_removed:
+            record["allow_removed"] = True
+        new_metadata = {**old_metadata, plugin_name: record}
         _swap_in_plugin(tmp_target, target, Path(tmp) / "previous-plugin", old_metadata, new_metadata)
 
     if not _looks_like_plugin_dir(target):
@@ -846,12 +854,12 @@ def cmd_install(
     try:
         if entry is not None:
             target, installed_manifest, installed_name = catalog.install_catalog_entry(
-                entry, force=force, ref=ref, allow_removed=True, scan_decision_cb=_interactive_scan_decision,
+                entry, force=force, ref=ref, allow_removed=allow_removed, scan_decision_cb=_interactive_scan_decision,
                 python_deps=not no_deps)
         else:
             target, installed_manifest, installed_name = _install_plugin_core(
                 identifier, force=force, ref=ref, scan_decision_cb=_interactive_scan_decision,
-                python_deps=not no_deps)
+                python_deps=not no_deps, allow_removed=allow_removed)
     except PluginOperationError as e:
         _fail(console, f"[red]{'Blocked' if isinstance(e, PluginScanBlocked) else 'Error'}:[/red] {e}")
     if not _looks_like_plugin_dir(target):
@@ -882,7 +890,8 @@ def cmd_install(
 
 
 def _pull_plugin_update(target: Path, pinned_msg, not_git_msg, before_pull=None) -> str:
-    """Shared ``update`` core: refuse pinned / non-git checkouts, ``git pull``, record the new
+    """Shared ``update`` core: refuse pinned checkouts, ``git pull`` (or re-install from the
+    recorded source when the tree carries no ``.git`` — subdirectory installs), record the new
     revision. Returns the pull output; raises :class:`PluginOperationError` on any refusal.
     *pinned_msg(install_record)* / *not_git_msg()* build the caller-specific error text."""
     metadata = _read_install_metadata()
@@ -890,7 +899,15 @@ def _pull_plugin_update(target: Path, pinned_msg, not_git_msg, before_pull=None)
     if install_record.get("pinned") is True:
         raise PluginOperationError(pinned_msg(install_record))
     if not (target / ".git").exists():
-        raise PluginOperationError(not_git_msg())
+        source = install_record.get("source")
+        if not isinstance(source, str) or not source:
+            raise PluginOperationError(not_git_msg())
+        if before_pull is not None:
+            before_pull()
+        return _reclone_plugin_update(source, install_record.get("revision"))
+    # A URL install whose name/repo later landed on the kill list must not keep pulling new code.
+    from hermes_cli import plugins_cmd_catalog as catalog
+    catalog.refuse_if_installed_removed(target.name, target)
     if before_pull is not None:
         before_pull()
     ok, output = _git_pull_plugin_dir(target)
@@ -903,6 +920,19 @@ def _pull_plugin_update(target: Path, pinned_msg, not_git_msg, before_pull=None)
         metadata[target.name] = install_record
         _write_install_metadata(metadata)
     return output
+
+
+def _reclone_plugin_update(source: str, previous_revision: object) -> str:
+    """Update a plugin whose tree is not a git checkout: a subdirectory install ships only
+    ``<clone>/<subdir>``, so the ``.git`` stays in the temp clone (#65314). Re-run the install
+    from the recorded source (same URL, same subdir) and swap the fresh tree in; the metadata
+    revision is rewritten by the installer. Returns pull-shaped output for the callers."""
+    new_target, _manifest, _name = _install_plugin_core(source, force=True)
+    revision = str(_read_install_metadata().get(new_target.name, {}).get("revision") or "")
+    previous = previous_revision if isinstance(previous_revision, str) else ""
+    if revision and revision == previous:
+        return "Already up to date."
+    return f"Re-installed from {source}: {previous[:8]}..{revision[:8]}"
 
 
 def cmd_update(name: str) -> None:
@@ -984,7 +1014,7 @@ def _remove_plugin_core(target: Path) -> None:
     """Remove one plugin and its metadata without splitting their state."""
     metadata = _read_install_metadata()
     if target.name not in metadata:
-        shutil.rmtree(target)
+        rmtree_readonly(target)
         return
     updated = {k: v for k, v in metadata.items() if k != target.name}
     staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.remove-", dir=target.parent))
@@ -1000,9 +1030,9 @@ def _remove_plugin_core(target: Path) -> None:
                 f"Plugin metadata update failed and '{target.name}' could not be "
                 f"restored automatically; recovery copy remains at {backup}."
             ) from restore_exc
-        shutil.rmtree(staging, ignore_errors=True)
+        rmtree_readonly(staging, ignore_errors=True)
         raise
-    shutil.rmtree(staging)
+    rmtree_readonly(staging)
 
 
 def cmd_remove(name: str) -> None:
@@ -1127,6 +1157,13 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
         _fail(console, _unknown_plugin_message(name))
     key, source = resolved
     _refuse_legacy_relay(key)
+    if source != "bundled":
+        # Activating recalled code is the same act as installing it (`plugins/AGENTS.md`: kill list).
+        from hermes_cli import plugins_cmd_catalog as catalog
+        try:
+            catalog.refuse_if_installed_removed(key, _user_installed_plugin_dir(key.rsplit("/", 1)[-1]))
+        except PluginOperationError as exc:
+            _fail(console, f"[red]Error:[/red] {exc}")
 
     enabled = _get_enabled_set()
     disabled = _get_disabled_set()
@@ -1857,7 +1894,7 @@ def dashboard_install_plugin(
     try:
         if entry is not None:
             target, installed_manifest, installed_name = catalog.install_catalog_entry(
-                entry, force=force, allow_removed=True)
+                entry, force=force, allow_removed=False)
         else:
             target, installed_manifest, installed_name = _install_plugin_core(
                 identifier, force=force, ref=(ref or "").strip() or None)
@@ -1980,10 +2017,11 @@ def dashboard_update_user_plugin(name: str) -> dict[str, Any]:
     sidecar = catalog.read_catalog_sidecar(target)
     try:
         if sidecar:
-            sha, changed = catalog.repin_catalog_plugin(target, sidecar)
-            warnings: list[str] = []
-            deps = _install_python_dependencies_quietly(target, warnings) if changed else []
-            return {"ok": True, "name": name, "sha": sha, "unchanged": not changed,
+            result = catalog.repin_catalog_plugin(target, sidecar)
+            warnings = list(result.warnings)
+            new_target = target.parent / result.installed_name
+            deps = _install_python_dependencies_quietly(new_target, warnings) if result.changed else []
+            return {"ok": True, "name": result.installed_name, "sha": result.sha, "unchanged": not result.changed,
                     "python_dependencies": deps, "warnings": warnings}
         msg = _pull_plugin_update(
             target,
@@ -2034,23 +2072,31 @@ def _stash_ref(git_exe: str, target: Path) -> str:
     return probe.stdout.strip() if probe.returncode == 0 else ""
 
 
-def _reapply_stash(git_exe: str, target: Path) -> bool:
-    """``stash apply`` the autostash; drop it on a clean apply. False when it applied with
-    errors or left unmerged paths (the stash entry is kept in that case)."""
-    restore = _run_plugin_git(git_exe, target, "stash", "apply", "stash@{0}")
+def _reapply_stash(git_exe: str, target: Path, stash_sha: str) -> bool:
+    """``stash apply`` the autostash commit *stash_sha*; drop it on a clean apply. False when it
+    applied with errors or left unmerged paths (the stash entry is kept in that case).
+
+    Git is addressed by the stash's commit sha, never a ``stash@{N}`` selector: on native Windows
+    the MSYS runtime re-parses git.exe's argv and strips the braces, so ``stash@{0}`` reaches git
+    as ``stash@0`` and both the apply and the drop fail (#87542)."""
+    restore = _run_plugin_git(git_exe, target, "stash", "apply", stash_sha)
     unmerged = _run_plugin_git(git_exe, target, "diff", "--name-only", "--diff-filter=U")
     if restore.returncode != 0 or unmerged.stdout.strip():
         return False
-    _run_plugin_git(git_exe, target, "stash", "drop", "stash@{0}")
+    # `stash drop` only takes a selector; a bare `drop` targets the newest entry, so drop
+    # positionally only while the newest entry is still our autostash.
+    if _stash_ref(git_exe, target) == stash_sha:
+        _run_plugin_git(git_exe, target, "stash", "drop")
     return True
 
 
-def _autostash_dirty_tree(git_exe: str, target: Path) -> tuple[bool, str]:
-    """Stash local edits before a pull. Returns ``(stash_created, error)``; a non-empty error means
-    the tree is dirty but nothing was saved, so the pull must not run."""
+def _autostash_dirty_tree(git_exe: str, target: Path) -> tuple[str, str]:
+    """Stash local edits before a pull. Returns ``(stash_sha, error)``; *stash_sha* is empty when
+    the tree was clean, and a non-empty error means the tree is dirty but nothing was saved, so
+    the pull must not run."""
     status = _run_plugin_git(git_exe, target, "status", "--porcelain", "-z")
     if status.returncode != 0 or not status.stdout.strip():
-        return False, ""
+        return "", ""
     # `git add -N` entries make `git stash push` fail outright (see update_cmd_stash), so promote them
     # to real staged adds first; the checkout's own local edits are otherwise unstashable.
     from hermes_cli.update_cmd_stash import _intent_to_add_paths
@@ -2064,7 +2110,7 @@ def _autostash_dirty_tree(git_exe: str, target: Path) -> tuple[bool, str]:
     post_stash = _stash_ref(git_exe, target)
     if not post_stash or post_stash == pre_stash:
         err = _safe_git_error(push)
-        return False, (
+        return "", (
             "Local changes in the plugin checkout could not be "
             "stashed; update aborted before touching the checkout."
             + (f"\n{err}" if err else ""))
@@ -2072,7 +2118,7 @@ def _autostash_dirty_tree(git_exe: str, target: Path) -> tuple[bool, str]:
         # Saved-but-couldn't-clean (undeletable untracked files): the stash entry is complete;
         # reset tracked mods so the pull isn't blocked by a still-dirty tree.
         _run_plugin_git(git_exe, target, "reset", "--hard", "HEAD")
-    return True, ""
+    return post_stash, ""
 
 
 def _git_pull_plugin_dir(target: Path) -> tuple[bool, str]:
@@ -2089,26 +2135,26 @@ def _git_pull_plugin_dir(target: Path) -> tuple[bool, str]:
     if not git_exe:
         return False, "git is not installed or not in PATH."
     try:
-        stash_created, err = _autostash_dirty_tree(git_exe, target)
+        stash_sha, err = _autostash_dirty_tree(git_exe, target)
         if err:
             return False, err
         origin = _run_plugin_git(git_exe, target, "remote", "get-url", "origin", timeout=15)
         result = _run_plugin_git(git_exe, target, "pull", "--ff-only", auth_url=origin.stdout.strip())
         if result.returncode != 0:
             err = _safe_git_error(result) or "git pull failed."
-            if not stash_created:
+            if not stash_sha:
                 return False, err
             # Put the user's edits back before reporting the failure.
-            if _reapply_stash(git_exe, target):
+            if _reapply_stash(git_exe, target, stash_sha):
                 note = "Local changes were restored."
             else:
                 note = "Local changes are preserved in git stash (restore with: git stash pop)."
             return False, f"{err}\n{note}"
 
         pulled = result.stdout.strip()
-        if not stash_created:
+        if not stash_sha:
             return True, pulled
-        if _reapply_stash(git_exe, target):
+        if _reapply_stash(git_exe, target, stash_sha):
             return True, pulled + "\nLocal changes were re-applied on top of the update."
 
         # Conflicted re-apply: leave the plugin importable on the updated
@@ -2117,7 +2163,7 @@ def _git_pull_plugin_dir(target: Path) -> tuple[bool, str]:
         return True, pulled + (
             "\n⚠ Local changes in this plugin conflicted with the update and "
             "were NOT re-applied. They are preserved in git stash — inspect "
-            "with `git stash show -p stash@{0}` and re-apply with "
+            "with `git stash show -p` and re-apply with "
             f"`git stash pop` inside {target}.")
     except FileNotFoundError:
         return False, "git is not installed or not in PATH."
