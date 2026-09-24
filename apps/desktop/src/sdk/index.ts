@@ -106,6 +106,7 @@ import {
 import { runGatewayRestart } from '@/store/system-actions'
 import type { PaginatedSessions, UsageStats } from '@/types/hermes'
 
+import { composerHost } from './composer'
 import { planPluginOpenSession } from './plugin-open-session-plan'
 
 // -- state: readonly views over the app's live atoms -------------------------
@@ -1553,7 +1554,9 @@ export const host = {
    *  components that take a `HermesGateway` prop directly (e.g. `ConnectorsTab`),
    *  which need the instance, not just a JSON-RPC door. Re-read per use — the
    *  active instance changes on a profile swap. */
-  getGateway: (): HermesGateway | null => $gateway.get()
+  getGateway: (): HermesGateway | null => $gateway.get(),
+
+  composer: composerHost
 }
 
 // -- react bridge -------------------------------------------------------------
@@ -1638,13 +1641,21 @@ export {
   PanelSectionLabel
 } from '@/app/overlays/panel'
 export {
+  type ProfileGroupHeaderContribution,
+  type ProfileGroupRoute,
   type RouteContribution,
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
+  SIDEBAR_PROFILE_GROUP_HEADER_AREA,
   type SidebarNavContribution,
   WORKSPACE_PAGE_HEADER_AREA
 } from '@/app/routes'
 
+/** THE settings rows: `ListRow` is label + description with the control beside
+ *  it (wide) or under it (narrow); `ToggleRow` is the one on/off row — a Switch,
+ *  never an Off/On pill pair. Use them for preference rows in plugin panes and
+ *  dialogs so they line up with core Settings. */
+export { ListRow, ToggleRow } from '@/app/settings/primitives'
 /** THE full per-toolset config panel core Settings renders — provider picker,
  *  env vars / API keys, model catalog picker, and post-setup runners. Route-
  *  decoupled (the "manage keys" deep link is a no-op outside the router); pass
@@ -1690,6 +1701,7 @@ export { ColorSwatches } from '@/components/ui/color-swatches'
 export { ConfirmDialog } from '@/components/ui/confirm-dialog'
 export {
   ContextMenu,
+  ContextMenuCheckboxItem,
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuSeparator,
@@ -1855,6 +1867,9 @@ export const TITLEBAR_AREAS = { center: 'titleBar.center', left: 'titleBar.left'
  *  setup.runtime_check, reconciled) — pass `host.request`. Don't hand-roll
  *  readiness from raw RPC shapes. */
 export { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
+/** A sibling WebSocket beside the route's `/api/ws` (voice PCM, Bot Screen RFB):
+ *  same origin, same auth resolution as chat. */
+export { resolveSiblingWsUrl, type SiblingWsRoute } from '@/lib/sibling-ws-url'
 /** Canonical time formatting — every surface pulls from here so timestamps read
  *  the same app-wide. For a row's AGE, bucket with `coarseElapsed` and render
  *  the compact suffixes (`t.sidebar.row.ageMin` → "52m"), which is what the
@@ -1917,6 +1932,8 @@ export { THEMES_AREA } from '@/themes/user-themes'
 export type { StatusResponse } from '@/types/hermes'
 /** Public SDK name for the shared gateway wire event; kept stable for plugins. */
 export type { GatewayEvent as RpcEvent } from '@hermes/shared'
+/** Bot Screen wire shapes, generated from `tui_gateway/contracts/display.py`. */
+export type { DisplayLease, DisplayObserveResult, DisplayStatus, DisplayThumbnailResult } from '@hermes/shared'
 /** THE compact-number formatter — every user-facing count/token figure goes
  *  through here (1230 → "1.2k", 1_500_000 → "1.5M"). Don't hand-roll `/1000`. */
 export { compactNumber } from '@hermes/shared'
